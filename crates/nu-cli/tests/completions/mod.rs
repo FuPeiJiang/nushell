@@ -15,9 +15,11 @@ use nu_protocol::{
     Config, ParseError, PipelineData, Value, debugger::WithoutDebug, engine::StateWorkingSet,
 };
 use nu_std::load_standard_library;
-use nu_test_support::fs;
+use nu_test_support::{fs, playground::Playground, test as nu_test};
 use reedline::{Span, Suggestion, Suggestions};
 use rstest::{fixture, rstest};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use support::{
     completions_helpers::{
         new_dotnu_engine, new_engine_helper, new_external_engine, new_partial_engine,
@@ -1606,6 +1608,50 @@ fn file_completions() {
 
     // Match the results
     match_suggestions(&expected_paths, &suggestions)
+}
+
+#[cfg(unix)]
+#[test]
+fn file_completions_traverse_unreadable_exact_parent_components() {
+    Playground::setup(
+        "file_completions_traverse_unreadable_exact_parent_components",
+        |dirs, playground| {
+            playground.mkdir("unreadable/child/target");
+
+            let unreadable_parent = dirs.test().join("unreadable");
+            let traversable_child = unreadable_parent.join("child");
+            let target = traversable_child.join("target");
+            std::fs::set_permissions(&unreadable_parent, std::fs::Permissions::from_mode(0o111))
+                .expect("make parent execute-only");
+
+            if unreadable_parent.read_dir().is_ok() {
+                std::fs::set_permissions(
+                    &unreadable_parent,
+                    std::fs::Permissions::from_mode(0o700),
+                )
+                .expect("restore parent permissions");
+                panic!("execute-only directory remained readable; permission test is invalid");
+            }
+
+            assert!(
+                traversable_child.read_dir().is_ok(),
+                "known child should remain traversable through execute-only parent"
+            );
+
+            let tester = nu_test().cwd(dirs.test());
+            let mut completer =
+                NuCompleter::new(Arc::new(tester.engine_state), Arc::new(tester.stack));
+            let input = format!("cp {}", folder(&traversable_child));
+            let suggestions = completer.complete_blocking(&input, input.len());
+            let expected_paths = [folder(&target)];
+
+            // Restore before assertions so Playground can always clean up the tree.
+            std::fs::set_permissions(&unreadable_parent, std::fs::Permissions::from_mode(0o700))
+                .expect("restore parent permissions");
+
+            match_suggestions_by_string(&expected_paths, &suggestions);
+        },
+    );
 }
 
 #[test]

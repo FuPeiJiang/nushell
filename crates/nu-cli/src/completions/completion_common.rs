@@ -1,4 +1,4 @@
-use super::{MatchAlgorithm, completion_options::NuMatcher};
+use super::{MatchAlgorithm, completion_options::NuMatcher, directory_handle::Dir};
 use crate::completions::{
     CompletionOptions, Context, Fetched, SemanticSuggestion, to_reedline_span,
 };
@@ -13,13 +13,12 @@ use nu_protocol::{
 use nu_utils::IgnoreCaseExt;
 use nu_utils::get_ls_colors;
 use reedline::Suggestion;
-use std::fmt::Write;
 use std::path::{Component, MAIN_SEPARATOR as SEP, Path, PathBuf, is_separator};
+use std::{ffi::OsStr, fmt::Write, num::NonZeroUsize};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Default)]
 pub struct PathBuiltFromString {
-    cwd: PathBuf,
     parts: Vec<MatchedPart>,
     isdir: bool,
 }
@@ -30,18 +29,87 @@ pub struct MatchedPart {
     match_indices: Vec<usize>,
 }
 
+/// Arena of output-path components accumulated during one completion request.
+///
+/// Each traversal candidate stores only a one-word `PathTail` identifying its last component.
+/// Extending a path appends one node to this contiguous Vec, so it is O(1) in path depth
+/// without a separate node allocation or atomic reference-count update per component.
+#[derive(Clone, Copy, Default)]
+struct PathTail(Option<NonZeroUsize>);
+
+impl PathTail {
+    fn from_index(index: usize) -> Self {
+        let encoded = index
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+            .expect("path arena index overflow");
+        Self(Some(encoded))
+    }
+
+    fn index(self) -> Option<usize> {
+        self.0.map(|encoded| encoded.get() - 1)
+    }
+}
+
+#[derive(Default)]
+struct PathArena {
+    nodes: Vec<PathPartNode>,
+}
+
+struct PathPartNode {
+    parent: PathTail,
+    part: MatchedPart,
+}
+
+impl PathArena {
+    fn push(&mut self, parent: PathTail, part: MatchedPart) -> PathTail {
+        let tail = PathTail::from_index(self.nodes.len());
+        self.nodes.push(PathPartNode { parent, part });
+        tail
+    }
+
+    fn to_vec(&self, tail: PathTail) -> Vec<MatchedPart> {
+        // Count first so materialization needs one Vec allocation rather than collecting
+        // references and then allocating a second Vec for the cloned output parts.
+        let mut len = 0;
+        let mut current = tail;
+        while let Some(index) = current.index() {
+            len += 1;
+            current = self.nodes[index].parent;
+        }
+
+        let mut parts = Vec::with_capacity(len);
+        let mut current = tail;
+        while let Some(index) = current.index() {
+            let node = &self.nodes[index];
+            parts.push(node.part.clone());
+            current = node.parent;
+        }
+        parts.reverse();
+        parts
+    }
+}
+
+/// A live traversal branch. The filesystem location is an open directory handle rather
+/// than a reconstructed path, and `tail` points into the request-local output-path arena.
+/// Extending this state is therefore O(1) with respect to path depth.
+#[derive(Clone)]
+struct TraversalCandidate {
+    dir: Dir,
+    tail: PathTail,
+}
+
 /// Recursively goes through paths that match a given `partial`.
-/// * `built_paths`: State struct for a valid matching path built so far.
-/// * `want_directory`: Whether we want only directories as completion matches.
-///   Some commands like `cd` can only be run on directories whereas others
-///   like `ls` can be run on regular files as well.
+/// * `built_paths`: Open-directory state for valid matching paths built so far.
+/// * `want_directory`: Whether final completion matches must be directories.
 /// * `isdir`: whether the current partial path has a trailing slash.
 ///   Parsing a path string into a pathbuf loses that bit of information.
 /// * `enable_exact_match`: Whether match algorithm is Prefix and all previous components
 ///   of the path matched a directory exactly.
 fn complete_rec(
     partial: &[&str],
-    built_paths: &[PathBuiltFromString],
+    built_paths: &[TraversalCandidate],
+    arena: &mut PathArena,
     options: &CompletionOptions,
     want_directory: bool,
     isdir: bool,
@@ -55,19 +123,28 @@ fn complete_rec(
     {
         let built_paths: Vec<_> = built_paths
             .iter()
-            .map(|built| {
-                let mut built = built.clone();
-                built.parts.push(MatchedPart {
-                    text: base.to_string(),
-                    match_indices: Vec::new(),
-                });
-                built.isdir = true;
-                built
+            .filter_map(|built| {
+                let dir = if base == "." {
+                    built.dir.clone()
+                } else {
+                    built.dir.open_dir(OsStr::new(base)).ok()?
+                };
+                Some(TraversalCandidate {
+                    dir,
+                    tail: arena.push(
+                        built.tail,
+                        MatchedPart {
+                            text: base.to_string(),
+                            match_indices: Vec::new(),
+                        },
+                    ),
+                })
             })
             .collect();
         return complete_rec(
             rest,
             &built_paths,
+            arena,
             options,
             want_directory,
             isdir,
@@ -75,101 +152,371 @@ fn complete_rec(
         );
     }
 
-    let prefix = partial.first().unwrap_or(&"");
-    let mut matcher = NuMatcher::new(prefix, options, true);
-
-    let mut exact_match = None;
-    // Only relevant for case insensitive matching
-    let mut multiple_exact_matches = false;
-    for built in built_paths {
-        let mut path = built.cwd.clone();
-        for part in &built.parts {
-            path.push(part.text.as_str());
-        }
-
-        let Ok(result) = path.read_dir() else {
-            continue;
-        };
-
-        for entry in result.filter_map(|e| e.ok()) {
-            let entry_name = entry.file_name().to_string_lossy().into_owned();
-            let entry_isdir = entry.path().is_dir();
-            if want_directory && !entry_isdir {
-                continue;
-            }
-            // Match before cloning: the clone copies the whole accumulated path per entry,
-            // but only the few matches survive, and an exact match is also a prefix match.
-            if matcher.check_match(&entry_name).is_none() {
-                continue;
-            }
-
-            let mut built = built.clone();
-            built.isdir = entry_isdir;
-
-            if enable_exact_match && !multiple_exact_matches && has_more {
-                let matches = if options.case_sensitive {
-                    entry_name.eq(prefix)
-                } else {
-                    entry_name.eq_ignore_case(prefix)
-                };
-                if matches {
-                    if exact_match.is_none() {
-                        let mut built_exact = built.clone();
-                        let match_indices = (0..entry_name.graphemes(true).count()).collect();
-                        built_exact.parts.push(MatchedPart {
-                            text: entry_name.clone(),
-                            match_indices,
-                        });
-                        exact_match = Some(built_exact);
-                    } else {
-                        multiple_exact_matches = true;
-                    }
-                }
-            }
-
-            matcher.add(entry_name.clone(), (built, entry_name));
-        }
-    }
-
-    // Don't show longer completions if we have a single exact match (#13204, #14794)
-    if !multiple_exact_matches && let Some(built) = exact_match {
-        return complete_rec(
-            &partial[1..],
-            &[built],
+    if has_more {
+        complete_intermediate(
+            partial,
+            built_paths,
+            arena,
             options,
             want_directory,
             isdir,
-            true,
-        );
+            enable_exact_match,
+        )
+    } else {
+        complete_final(
+            partial.first().unwrap_or(&""),
+            built_paths,
+            arena,
+            options,
+            want_directory,
+        )
     }
+}
 
-    let completion_iter =
-        matcher
-            .results()
-            .into_iter()
-            .map(|((mut built, last_entry_name), last_match_indices)| {
-                built.parts.push(MatchedPart {
-                    text: last_entry_name,
-                    match_indices: last_match_indices,
-                });
-                built
-            });
+fn complete_intermediate(
+    partial: &[&str],
+    built_paths: &[TraversalCandidate],
+    arena: &mut PathArena,
+    options: &CompletionOptions,
+    want_directory: bool,
+    isdir: bool,
+    enable_exact_match: bool,
+) -> Vec<PathBuiltFromString> {
+    let prefix = partial.first().unwrap_or(&"");
+    let prefix_os = OsStr::new(prefix);
+    let mut matcher = NuMatcher::new(prefix, options, true);
+    let mut completions = Vec::new();
 
-    if has_more {
-        completion_iter
-            .flat_map(|completion| {
-                complete_rec(
+    for built in built_paths {
+        let entries = match built.dir.entries() {
+            Ok(entries) => entries,
+            Err(err) => {
+                // Enumeration needs read/list permission, while handle-relative lookup
+                // of a known child may need only search/traverse permission. If listing
+                // is denied, there are no sibling names to discover: follow only the
+                // literal component the user supplied. Preserve exactness so a branch
+                // that became non-exact earlier never regains exact pruning.
+                if !prefix.is_empty()
+                    && err.kind() == std::io::ErrorKind::PermissionDenied
+                    && let Ok(dir) = built.dir.open_dir(prefix_os)
+                {
+                    let literal = TraversalCandidate {
+                        dir,
+                        tail: arena.push(
+                            built.tail,
+                            MatchedPart {
+                                text: prefix.to_string(),
+                                match_indices: (0..prefix.graphemes(true).count()).collect(),
+                            },
+                        ),
+                    };
+                    completions.extend(complete_rec(
+                        &partial[1..],
+                        &[literal],
+                        arena,
+                        options,
+                        want_directory,
+                        isdir,
+                        enable_exact_match,
+                    ));
+                }
+                continue;
+            }
+        };
+
+        if enable_exact_match {
+            // Look only for exact-name uniqueness first. Do not allocate/build ordinary
+            // matcher candidates unless this shortcut fails. Opening an exact directory
+            // also produces the child handle needed by the next recursion in the same
+            // operation; obvious non-directory entries are rejected from their type hint.
+            let mut exact = None;
+            let mut multiple_exact_matches = false;
+
+            for entry in &entries {
+                let entry_name = entry.file_name().to_string_lossy();
+                let is_exact = if options.case_sensitive {
+                    entry_name.as_ref() == *prefix
+                } else {
+                    entry_name.eq_ignore_case(prefix)
+                };
+                if !is_exact {
+                    continue;
+                }
+
+                let Ok(dir) = built.dir.open_entry_dir(entry) else {
+                    continue;
+                };
+                if exact.is_none() {
+                    exact = Some((entry_name.into_owned(), dir));
+                } else {
+                    multiple_exact_matches = true;
+                    break;
+                }
+            }
+
+            if !multiple_exact_matches && let Some((entry_name, dir)) = exact {
+                let exact = TraversalCandidate {
+                    dir,
+                    tail: arena.push(
+                        built.tail,
+                        MatchedPart {
+                            match_indices: (0..entry_name.graphemes(true).count()).collect(),
+                            text: entry_name,
+                        },
+                    ),
+                };
+                completions.extend(complete_rec(
                     &partial[1..],
-                    &[completion],
+                    &[exact],
+                    arena,
                     options,
                     want_directory,
                     isdir,
-                    false,
-                )
+                    true,
+                ));
+                continue;
+            }
+        }
+
+        for entry in entries {
+            let entry_name = entry.file_name().to_string_lossy();
+            let Some(prepared) = matcher.prepare_match(entry_name.as_ref()) else {
+                continue;
+            };
+
+            // Keep names borrowed until they actually match. This avoids allocating a String for
+            // every non-matching directory entry, which matters in wide directories. Committing
+            // the prepared match also avoids running the matcher a second time for survivors.
+            // Borrow the parent handle through sorting instead of cloning its refcount once per
+            // matching sibling. Child handles are still opened one-at-a-time before recursion.
+            matcher.add_prepared_owned(
+                entry_name.into_owned(),
+                prepared,
+                (built.tail, &built.dir, entry),
+            );
+        }
+    }
+
+    for ((tail, parent, entry), match_indices) in matcher.results() {
+        // A directory-type hint rejects obvious files without a syscall. A surviving
+        // entry is opened relative to its parent exactly once to obtain the next handle.
+        let Ok(dir) = parent.open_entry_dir(&entry) else {
+            continue;
+        };
+        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        let candidate = TraversalCandidate {
+            dir,
+            tail: arena.push(
+                tail,
+                MatchedPart {
+                    text: entry_name,
+                    match_indices,
+                },
+            ),
+        };
+        completions.extend(complete_rec(
+            &partial[1..],
+            &[candidate],
+            arena,
+            options,
+            want_directory,
+            isdir,
+            false,
+        ));
+    }
+    completions
+}
+
+fn complete_final(
+    prefix: &str,
+    built_paths: &[TraversalCandidate],
+    arena: &PathArena,
+    options: &CompletionOptions,
+    want_directory: bool,
+) -> Vec<PathBuiltFromString> {
+    let mut matcher = NuMatcher::new(prefix, options, true);
+
+    for built in built_paths {
+        let Ok(entries) = built.dir.entries() else {
+            continue;
+        };
+
+        for entry in entries {
+            let entry_name = entry.file_name().to_string_lossy();
+            let Some(prepared) = matcher.prepare_match(entry_name.as_ref()) else {
+                continue;
+            };
+
+            let entry_isdir = built.dir.entry_is_dir(&entry);
+            if want_directory && !entry_isdir {
+                continue;
+            }
+            matcher.add_prepared_owned(
+                entry_name.into_owned(),
+                prepared,
+                (built.tail, entry, entry_isdir),
+            );
+        }
+    }
+
+    matcher
+        .results()
+        .into_iter()
+        .map(|((tail, entry, isdir), match_indices)| {
+            let mut parts = arena.to_vec(tail);
+            parts.push(MatchedPart {
+                text: entry.file_name().to_string_lossy().into_owned(),
+                match_indices,
+            });
+            PathBuiltFromString { parts, isdir }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod path_traversal_tests {
+    use super::*;
+
+    #[test]
+    fn path_tail_is_one_word() {
+        assert_eq!(
+            std::mem::size_of::<PathTail>(),
+            std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn path_arena_materializes_shared_prefixes() {
+        let mut arena = PathArena::default();
+        let root = arena.push(
+            PathTail::default(),
+            MatchedPart {
+                text: "root".into(),
+                match_indices: vec![0],
+            },
+        );
+        let left = arena.push(
+            root,
+            MatchedPart {
+                text: "left".into(),
+                match_indices: vec![1],
+            },
+        );
+        let right = arena.push(
+            root,
+            MatchedPart {
+                text: "right".into(),
+                match_indices: vec![2],
+            },
+        );
+
+        let texts = |tail| {
+            arena
+                .to_vec(tail)
+                .into_iter()
+                .map(|part| part.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(left), ["root", "left"]);
+        assert_eq!(texts(right), ["root", "right"]);
+    }
+
+    fn complete_directory_path(roots: &[PathBuf], partial: &[&str]) -> Vec<String> {
+        let built_paths: Vec<_> = roots
+            .iter()
+            .map(|root| TraversalCandidate {
+                dir: Dir::open(root).expect("open completion root"),
+                tail: PathTail::default(),
             })
-            .collect()
-    } else {
-        completion_iter.collect()
+            .collect();
+        let options = CompletionOptions::default();
+        let mut arena = PathArena::default();
+        let mut results: Vec<_> = complete_rec(
+            partial,
+            &built_paths,
+            &mut arena,
+            &options,
+            true,
+            true,
+            options.match_algorithm == MatchAlgorithm::Prefix,
+        )
+        .into_iter()
+        .map(|path| {
+            path.parts
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect();
+        results.sort();
+        results
+    }
+
+    #[test]
+    fn exact_pruning_is_independent_for_each_cwd() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let one = temp.path().join("one");
+        let two = temp.path().join("two");
+        std::fs::create_dir_all(one.join("foo/a")).expect("create first fixture");
+        std::fs::create_dir_all(two.join("foobar/b")).expect("create second fixture");
+
+        assert_eq!(
+            complete_directory_path(&[one, two], &["foo"]),
+            ["foo/a", "foobar/b"]
+        );
+    }
+
+    #[test]
+    fn exact_directory_in_each_cwd_keeps_each_cwd() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let one = temp.path().join("one");
+        let two = temp.path().join("two");
+        std::fs::create_dir_all(one.join("foo/a")).expect("create first fixture");
+        std::fs::create_dir_all(two.join("foo/b")).expect("create second fixture");
+
+        assert_eq!(
+            complete_directory_path(&[one, two], &["foo"]),
+            ["foo/a", "foo/b"]
+        );
+    }
+
+    #[test]
+    fn later_exact_component_does_not_restore_pruning() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("partial/hol/foo")).expect("create exact fixture");
+        std::fs::create_dir_all(root.join("partial-a/hola/foo")).expect("create prefix fixture");
+
+        assert_eq!(
+            complete_directory_path(&[root], &["part", "hol"]),
+            ["partial-a/hola/foo", "partial/hol/foo"]
+        );
+    }
+
+    #[test]
+    fn exact_file_does_not_shadow_prefix_directory() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("foobar/child")).expect("create directory fixture");
+        std::fs::write(root.join("foo"), b"file").expect("create exact file fixture");
+
+        assert_eq!(complete_directory_path(&[root], &["foo"]), ["foobar/child"]);
+    }
+
+    #[test]
+    fn case_sensitive_exact_pruning_uses_directory_entry_spelling() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("Foo/wrong-case"))
+            .expect("create differently-cased fixture");
+        std::fs::create_dir_all(root.join("foobar/right-prefix"))
+            .expect("create matching prefix fixture");
+
+        assert_eq!(
+            complete_directory_path(&[root], &["foo"]),
+            ["foobar/right-prefix"]
+        );
     }
 }
 
@@ -324,9 +671,7 @@ pub fn complete_item(
             original_cwd = OriginalCwd::Prefix(String::new());
         }
         Some(Component::Normal(home)) if home.to_string_lossy() == "~" => {
-            cwds = home_dir()
-                .map(|dir| vec![dir.into()])
-                .unwrap_or(cwd_pathbufs);
+            cwds = home_dir().map(|dir| vec![dir.into()]).unwrap_or_default();
             prefix_len = 1;
             original_cwd = OriginalCwd::Home;
         }
@@ -343,16 +688,21 @@ pub fn complete_item(
         .filter(|s| !s.is_empty())
         .collect();
 
+    let built_paths: Vec<_> = cwds
+        .into_iter()
+        .filter_map(|cwd| {
+            Dir::open(&cwd).ok().map(|dir| TraversalCandidate {
+                dir,
+                tail: PathTail::default(),
+            })
+        })
+        .collect();
+
+    let mut arena = PathArena::default();
     complete_rec(
         partial.as_slice(),
-        &cwds
-            .into_iter()
-            .map(|cwd| PathBuiltFromString {
-                cwd,
-                parts: Vec::new(),
-                isdir: false,
-            })
-            .collect::<Vec<_>>(),
+        &built_paths,
+        &mut arena,
         options,
         want_directory,
         isdir,
@@ -484,7 +834,6 @@ fn collapse_ndots(path: PathBuiltFromString) -> PathBuiltFromString {
     let mut result = PathBuiltFromString {
         parts: Vec::with_capacity(path.parts.len()),
         isdir: path.isdir,
-        cwd: path.cwd,
     };
 
     let mut dot_count = 0;

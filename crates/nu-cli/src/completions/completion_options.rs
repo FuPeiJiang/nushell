@@ -50,6 +50,7 @@ enum State<T> {
 struct UnscoredMatch<T> {
     item: T,
     haystack: String,
+    folded_haystack: Option<String>,
     match_indices: Vec<usize>,
 }
 
@@ -57,6 +58,17 @@ struct FuzzyMatch<T> {
     item: T,
     haystack: String,
     score: u16,
+    match_indices: Vec<usize>,
+}
+
+/// Match work that has already been computed but not yet committed to the result set.
+/// Completion uses this to avoid running the matcher twice when it needs to perform an
+/// additional filesystem check only for matching entries.
+pub(super) struct PreparedMatch {
+    haystack_start: usize,
+    haystack_end: usize,
+    score: Option<u16>,
+    folded_haystack: Option<String>,
     match_indices: Vec<usize>,
 }
 
@@ -80,6 +92,8 @@ impl<T> NuMatcher<'_, T> {
             MatchAlgorithm::Prefix | MatchAlgorithm::Substring => {
                 let lowercase_needle = if options.case_sensitive {
                     needle.to_owned()
+                } else if needle.is_ascii() {
+                    needle.to_ascii_lowercase()
                 } else {
                     needle.to_folded_case()
                 };
@@ -120,16 +134,37 @@ impl<T> NuMatcher<'_, T> {
         }
     }
 
-    /// Returns whether or not the haystack matches the needle. If it does, `item` is added
-    /// to the list of matches (if given).
+    /// Compute a match without committing an item to the result set yet.
     ///
-    /// Helper to avoid code duplication between [NuMatcher::add] and [NuMatcher::matches].
-    fn matches_aux(&mut self, orig_haystack: &str, item: Option<T>) -> Option<Vec<usize>> {
+    /// This lets callers perform work that should happen only for matching candidates and then
+    /// commit the already-computed score/indices without running the matcher a second time.
+    pub(super) fn prepare_match(&mut self, orig_haystack: &str) -> Option<PreparedMatch> {
         let haystack = orig_haystack.trim_start_matches(QUOTES);
-        let offset = orig_haystack.len() - haystack.len();
+        let haystack_start = orig_haystack.len() - haystack.len();
         let haystack = haystack.trim_end_matches(QUOTES);
+        let haystack_end = haystack_start + haystack.len();
+
         match &mut self.state {
-            State::Unscored(matches) => {
+            State::Unscored(_) => {
+                if !self.options.case_sensitive
+                    && self.options.match_algorithm == MatchAlgorithm::Prefix
+                    && haystack.is_ascii()
+                    && self.needle.is_ascii()
+                {
+                    let needle_len = self.needle.len();
+                    let prefix = haystack.as_bytes().get(..needle_len)?;
+                    if !prefix.eq_ignore_ascii_case(self.needle.as_bytes()) {
+                        return None;
+                    }
+                    return Some(PreparedMatch {
+                        haystack_start,
+                        haystack_end,
+                        score: None,
+                        folded_haystack: self.should_sort.then(|| haystack.to_ascii_lowercase()),
+                        match_indices: (haystack_start..haystack_start + needle_len).collect(),
+                    });
+                }
+
                 let haystack_folded = if self.options.case_sensitive {
                     Cow::Borrowed(haystack)
                 } else {
@@ -146,46 +181,82 @@ impl<T> NuMatcher<'_, T> {
                     MatchAlgorithm::Substring => haystack_folded.find(self.needle.as_str()),
                     _ => unreachable!("Only prefix and substring algorithms don't use score"),
                 };
-                match_start.map(|byte_start| {
-                    let grapheme_start = haystack_folded[0..byte_start].graphemes(true).count();
-                    // TODO this doesn't account for lowercasing changing the length of the haystack
-                    let grapheme_len = self.needle.graphemes(true).count();
-                    let match_indices: Vec<usize> =
-                        (offset + grapheme_start..offset + grapheme_start + grapheme_len).collect();
-                    if let Some(item) = item {
-                        matches.push(UnscoredMatch {
-                            item,
-                            haystack: haystack.to_string(),
-                            match_indices: match_indices.clone(),
-                        });
+                let byte_start = match_start?;
+                let grapheme_start = haystack_folded[0..byte_start].graphemes(true).count();
+                // TODO this doesn't account for lowercasing changing the length of the haystack
+                let grapheme_len = self.needle.graphemes(true).count();
+                let folded_haystack = if self.should_sort {
+                    match haystack_folded {
+                        Cow::Owned(folded) => Some(folded),
+                        Cow::Borrowed(_) => None,
                     }
-                    match_indices
+                } else {
+                    None
+                };
+                Some(PreparedMatch {
+                    haystack_start,
+                    haystack_end,
+                    score: None,
+                    folded_haystack,
+                    match_indices: (haystack_start + grapheme_start
+                        ..haystack_start + grapheme_start + grapheme_len)
+                        .collect(),
                 })
             }
-            State::Fuzzy {
-                matcher,
-                atom,
-                matches,
-            } => {
+            State::Fuzzy { matcher, atom, .. } => {
                 let mut haystack_buf = Vec::new();
                 let haystack_utf32 = Utf32Str::new(haystack, &mut haystack_buf);
                 let mut indices = Vec::new();
                 let score = atom.indices(haystack_utf32, matcher, &mut indices)?;
-                let indices: Vec<usize> = indices
-                    .iter()
-                    .map(|i| {
-                        offset + usize::try_from(*i).expect("should be on at least a 32-bit system")
-                    })
-                    .collect();
-                if let Some(item) = item {
-                    matches.push(FuzzyMatch {
-                        item,
-                        haystack: haystack.to_string(),
-                        score,
-                        match_indices: indices.clone(),
-                    });
-                }
-                Some(indices)
+                Some(PreparedMatch {
+                    haystack_start,
+                    haystack_end,
+                    score: Some(score),
+                    folded_haystack: None,
+                    match_indices: indices
+                        .iter()
+                        .map(|i| {
+                            haystack_start
+                                + usize::try_from(*i)
+                                    .expect("should be on at least a 32-bit system")
+                        })
+                        .collect(),
+                })
+            }
+        }
+    }
+
+    /// Commit an already-computed match, reusing the caller's owned haystack allocation.
+    pub(super) fn add_prepared_owned(
+        &mut self,
+        mut haystack: String,
+        prepared: PreparedMatch,
+        item: T,
+    ) {
+        haystack.truncate(prepared.haystack_end);
+        if prepared.haystack_start != 0 {
+            haystack.replace_range(..prepared.haystack_start, "");
+        }
+
+        match &mut self.state {
+            State::Unscored(matches) => {
+                debug_assert!(prepared.score.is_none());
+                matches.push(UnscoredMatch {
+                    item,
+                    haystack,
+                    folded_haystack: prepared.folded_haystack,
+                    match_indices: prepared.match_indices,
+                });
+            }
+            State::Fuzzy { matches, .. } => {
+                matches.push(FuzzyMatch {
+                    item,
+                    haystack,
+                    score: prepared
+                        .score
+                        .expect("prepared fuzzy match should contain a score"),
+                    match_indices: prepared.match_indices,
+                });
             }
         }
     }
@@ -194,14 +265,20 @@ impl<T> NuMatcher<'_, T> {
     ///
     /// Returns whether the item was added.
     pub fn add(&mut self, haystack: impl AsRef<str>, item: T) -> bool {
-        self.matches_aux(haystack.as_ref(), Some(item)).is_some()
+        let haystack = haystack.as_ref();
+        let Some(prepared) = self.prepare_match(haystack) else {
+            return false;
+        };
+        self.add_prepared_owned(haystack.to_owned(), prepared, item);
+        true
     }
 
     /// Check if the given haystack matches the needle without adding it as a result.
     ///
     /// Returns match indices if it matched, None if it didn't.
     pub fn check_match(&mut self, haystack: &str) -> Option<Vec<usize>> {
-        self.matches_aux(haystack, None)
+        self.prepare_match(haystack)
+            .map(|prepared| prepared.match_indices)
     }
 
     fn sort(&mut self) {
@@ -212,9 +289,14 @@ impl<T> NuMatcher<'_, T> {
                     if self.options.case_sensitive {
                         cmp_sensitive
                     } else {
-                        a.haystack
-                            .to_folded_case()
-                            .cmp(&b.haystack.to_folded_case())
+                        a.folded_haystack
+                            .as_deref()
+                            .expect("case-insensitive match should retain folded haystack")
+                            .cmp(
+                                b.folded_haystack
+                                    .as_deref()
+                                    .expect("case-insensitive match should retain folded haystack"),
+                            )
                             .then(cmp_sensitive)
                     }
                 });
@@ -359,6 +441,30 @@ mod test {
         } else {
             assert_ne!(vec![haystack], results);
         }
+    }
+
+    #[rstest]
+    #[case(MatchAlgorithm::Prefix)]
+    #[case(MatchAlgorithm::Substring)]
+    #[case(MatchAlgorithm::Fuzzy)]
+    fn prepared_match_is_equivalent_to_add(#[case] match_algorithm: MatchAlgorithm) {
+        let options = CompletionOptions {
+            case_sensitive: false,
+            match_algorithm,
+            ..Default::default()
+        };
+        let haystacks = ["foo", "'Foo bar'", "food", "bar", "`fob`", "afoo"];
+        let mut normal = NuMatcher::new("fo", &options, true);
+        let mut prepared = NuMatcher::new("fo", &options, true);
+
+        for (index, haystack) in haystacks.into_iter().enumerate() {
+            normal.add(haystack, index);
+            if let Some(matched) = prepared.prepare_match(haystack) {
+                prepared.add_prepared_owned(haystack.to_owned(), matched, index);
+            }
+        }
+
+        assert_eq!(normal.results(), prepared.results());
     }
 
     #[test]
