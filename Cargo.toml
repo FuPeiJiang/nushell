@@ -43,6 +43,7 @@ ProductVersion = "0.114.2"
 ProductName = "Nushell"
 
 [workspace]
+exclude = ["vendor/crossterm-0.29.0-dead-tty-fix"]
 members = [
   "crates/nu_plugin_custom_values",
   "crates/nu_plugin_example",
@@ -492,6 +493,7 @@ bench = false
 # changing versions in each sub-crate of the workspace is tedious
 [patch.crates-io]
 reedline = { git = "https://github.com/nushell/reedline", branch = "main" }
+crossterm = { path = "vendor/crossterm-0.29.0-dead-tty-fix" }
 # nu-ansi-term = { git = "https://github.com/nushell/nu-ansi-term.git", branch = "main" }
 
 # Run all benchmarks with `cargo bench`
