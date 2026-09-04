@@ -37,20 +37,22 @@ fn read_position_raw() -> io::Result<(u16, u16)> {
 
     loop {
         match poll_internal(Some(Duration::from_millis(2000)), &CursorPositionFilter) {
-            Ok(true) => {
-                if let Ok(InternalEvent::CursorPosition(x, y)) =
-                    read_internal(&CursorPositionFilter)
-                {
-                    return Ok((x, y));
-                }
-            }
+            Ok(true) => match read_internal(&CursorPositionFilter) {
+                Ok(InternalEvent::CursorPosition(x, y)) => return Ok((x, y)),
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            },
             Ok(false) => {
                 return Err(Error::new(
                     ErrorKind::Other,
                     "The cursor position could not be read within a normal duration",
                 ));
             }
-            Err(_) => {}
+            // A signal may interrupt the wait transiently. Other errors, including a
+            // closed input TTY, cannot recover by immediately polling the same fd again.
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
 }
